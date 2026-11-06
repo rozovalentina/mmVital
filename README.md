@@ -6,13 +6,22 @@ Proyecto de la asignatura **[Sistemas Embebidos]** · **Lina Maria Ramirez y Val
 
 > **Aviso:** es un proyecto académico. Ni el radar ni el anillo son instrumentos médicos, y las mediciones no sirven para diagnóstico.
 
+## Contexto y objetivo
+
+La frecuencia cardíaca y la respiratoria se miden normalmente con sensores de contacto (ECG, PPG, bandas torácicas), que exigen buena colocación, son incómodos en monitoreo prolongado y pueden irritar la piel. Un radar FMCW de ondas milimétricas detecta los micromovimientos del tórax sin contacto.
+
+**Objetivo:** implementar un sistema embebido de bajo costo que controle el radar HLK-LD6002 desde una Raspberry Pi, adquiera, interprete, registre y visualice la respiración y el pulso, y compararlo en pruebas básicas contra un dispositivo de referencia comercial.
+
+**Fuera de alcance:** validación clínica, estudios con muchos participantes, modelos de IA y procesamiento propio de la señal cruda del radar (el sensor entrega HR y RR ya calculados).
+
 ## Contenido
 
+- [Contexto y objetivo](#contexto-y-objetivo)
 - [Qué hace](#qué-hace)
 - [Hardware](#hardware)
 - [Conexiones](#conexiones)
 - [Configuración de la Raspberry Pi](#configuración-de-la-raspberry-pi)
-- [Arquitectura](#arquitectura)
+- [Arquitectura de software](#arquitectura-de-software)
 - [Protocolo del radar](#protocolo-del-radar)
 - [Aplicación web](#aplicación-web)
 - [Instalación como servicio](#instalación-como-servicio)
@@ -42,6 +51,35 @@ Proyecto de la asignatura **[Sistemas Embebidos]** · **Lina Maria Ramirez y Val
 | Referencia | Anillo inteligente Colmi R06 (Bluetooth LE) |
 | Cableado | 4 cables dupont hembra-hembra |
 | Alimentación | Fuente de 5 V estable para la Pi |
+
+### Diagrama de bloques
+
+```mermaid
+flowchart LR
+    P(("Persona<br/>en reposo"))
+    F["Fuente 5 V"]
+    R["Radar HLK-LD6002<br/>60 GHz FMCW"]
+    subgraph PI["Raspberry Pi 3B"]
+        U["UART PL011<br/>/dev/serial0"]
+        BT["Bluetooth<br/>mini-UART"]
+        SW["radar.service<br/>Python + Flask"]
+        SD[("CSV diarios")]
+    end
+    A["Anillo Colmi R06<br/>referencia"]
+    N["Navegador<br/>en la red local"]
+
+    P -. "movimiento del tórax" .-> R
+    F -- "5 V" --> PI
+    PI -- "Pin 2 · 5 V / Pin 6 · GND" --> R
+    R -- "TX → GPIO15 · RXD0" --> U
+    U -- "GPIO14 · TXD0 → RX" --> R
+    U --> SW
+    A -. "BLE" .-> BT --> SW
+    SW --> SD
+    SW -. "WiFi · HTTP + SSE :5000" .-> N
+```
+
+El radar procesa la señal internamente y entrega por UART fases, frecuencia respiratoria, pulso, distancia y posición ya calculados. La Pi solo recibe, decodifica, registra, compara y publica.
 
 ## Conexiones
 
@@ -96,15 +134,23 @@ sudo usermod -aG dialout $USER
 
 El radar transmite a **115200 baudios**. El valor se determinó con `diagnostico/scan_baud.py`, que prueba varias velocidades y cuenta tramas con checksum válido: solo 115200 produjo tramas válidas.
 
-## Arquitectura
+## Arquitectura de software
 
-```
-HLK-LD6002 ──UART──► Raspberry Pi 3B ───► Flask (SSE) ───► navegador
-                      │  hilos:
-                      │   lector ─► cola ─► procesador ─► estado compartido
-                      │   registrador (CSV diario)
-                      │   sistema (CPU / temperatura / RAM)
-                      │   anillo ──► proceso aparte (BLE, Colmi R06)
+```mermaid
+flowchart LR
+    UART[/"/dev/serial0"/] --> L["lector<br/>ld6002.py"]
+    L -- "queue.Queue" --> P["procesador"]
+    P --> E[("estado compartido<br/>threading.Lock")]
+    S["sistema<br/>/proc y /sys"] --> E
+    E --> G["registrador"] --> C1[("datos_AAAA-MM-DD.csv")]
+    G --> H[("historial de pulso<br/>últimos 300 s")]
+    AN["anillo"] -- "subprocess" --> LA["leer_anillo.py"] -. "BLE" .-> R(("Colmi R06"))
+    H --> AN --> C2[("comparacion_AAAA-MM-DD.csv")]
+    AN --> E
+    E --> W["Flask /stream (SSE)"] --> I["templates/index.html"]
+    CR["cron 00:10"] --> RS["resumen.py"]
+    C1 --> RS
+    C2 --> RS
 ```
 
 | Hilo | Función |
@@ -117,6 +163,21 @@ HLK-LD6002 ──UART──► Raspberry Pi 3B ───► Flask (SSE) ──�
 
 Los hilos se comunican con una `queue.Queue` y el estado compartido se protege con un `threading.Lock`. La lectura del anillo corre en un **proceso separado** para que cualquier bloqueo del Bluetooth no afecte al radar.
 
+### Correspondencia con los módulos de la propuesta
+
+La propuesta planteaba un módulo por responsabilidad. En la implementación se agruparon en menos archivos, y cada responsabilidad quedó en un hilo:
+
+| Módulo propuesto | Implementación |
+|---|---|
+| `main.py` | `app.py`: arranca los hilos y el servidor Flask |
+| `config.py` | Constantes al inicio de `app.py` (`RING_ADDR`, `VENTANA_RADAR`…) y de `ld6002.py` (puerto, baudrate) |
+| `sensor_reader.py` | `ld6002.py` (`LD6002`) + hilo `lector` |
+| `data_parser.py` | `ld6002.py` (checksums y separación de tramas) + hilo `procesador` (decodifica cada tipo) |
+| `monitor.py` | Hilo `registrador` (CSV) y alertas de rango en la interfaz |
+| `interface.py` | Flask (`/`, `/stream`) + `templates/index.html` |
+| `comparison.py` | Hilo `anillo` + `leer_anillo.py`; resumen diario en `resumen.py` |
+| `logging` | Salida estándar del servicio, consultada con `journalctl -u radar` |
+
 ## Protocolo del radar
 
 Formato de trama (checksum = XOR de los bytes, invertido):
@@ -124,6 +185,8 @@ Formato de trama (checksum = XOR de los bytes, invertido):
 ```
 SOF(0x01) | ID(2) | LEN(2) | TYPE(2) | CKSUM_CABECERA(1) | DATOS(LEN) | CKSUM_DATOS(1)
 ```
+
+`ID`, `LEN` y `TYPE` vienen en big-endian; los valores dentro de `DATOS` son little-endian. El checksum de cabecera cubre los 7 primeros bytes (incluido el SOF). Si un checksum falla, se descarta un byte y se busca el siguiente SOF.
 
 Tipos observados en el sensor:
 
@@ -136,7 +199,7 @@ Tipos observados en el sensor:
 | `0x0A17` | 2 × float32 (x, y). Interpretación de ejes **por confirmar** |
 | `0x0100` | texto ASCII de depuración (se ignora) |
 
-Los tipos `0x0A04`, `0x0A17`, `0x0A18`, `0x0A38` y `0x0F09` aparecen con información de objetivo y estado y no se usan, salvo `0x0A17` para el mapa de posición. El script `diagnostico/ver_frames.py` lista los tipos que envía cada módulo.
+También aparecen los tipos `0x0A04`, `0x0A18`, `0x0A38` y `0x0F09`, con información de objetivo y estado; no se usan. El script `diagnostico/ver_frames.py` lista los tipos que envía cada módulo.
 
 ## Aplicación web
 
@@ -152,6 +215,12 @@ Servidor **Flask** en el puerto 5000. Los datos se envían al navegador con **Se
 Alertas configuradas: respiración < 8 o > 25 rpm, pulso < 50 o > 120 bpm, y más de 10 s sin presencia. Las etiquetas "Normal / Baja / Alta" usan 12–20 rpm y 60–100 bpm como rangos de adulto en reposo.
 
 ## Instalación como servicio
+
+Dependencias del sistema (el entorno virtual usa los paquetes del sistema para Flask y pyserial):
+
+```bash
+sudo apt install python3-flask python3-serial python3-venv bluez
+```
 
 Con el repositorio clonado en la Pi:
 
@@ -226,12 +295,42 @@ colmi_r02_client --address=79:21:9E:24:EC:BA set-heart-rate-log-settings --enabl
 
 ## Resultados
 
-> **[Completar]** Número de comparaciones, error medio absoluto (bpm), condiciones de la prueba (posición, distancia, duración), conteo manual de respiración vs radar, y capturas de la interfaz.
+Capturas de una sesión de prueba con el sistema completo funcionando: una persona sentada frente al radar, con el anillo puesto.
 
-<!--
-![Interfaz web](docs/interfaz.png)
-![Comparación radar vs anillo](docs/comparacion.png)
--->
+![Interfaz web: signos vitales, referencia y ondas de fase](docs/interfaz_vitales.jpg)
+
+![Interfaz web: tendencias, posición, distancia y estado del sistema](docs/interfaz_tendencias.png)
+
+**Funcionamiento del sistema** (sesión de 4 min 37 s):
+
+| Indicador | Valor observado |
+|---|---|
+| Tramas recibidas | 28 948, a ~100 tramas/s |
+| Tramas descartadas por cola llena | 0 |
+| Edad del último dato | 0,09 s |
+| CPU de la Pi | 1,3 % |
+| Temperatura de la Pi | 50,5 °C |
+| RAM usada | 36,4 % |
+| Prioridad del proceso | `nice` −5 |
+| Hilos activos | 7 |
+
+El radar entregó datos de forma continua, sin pérdidas en la cola, y la Pi 3B trabajó con muy poca carga. Las ondas de fase de respiración y de corazón se dibujaron en tiempo real.
+
+**Mediciones en la sesión:**
+
+| Variable | Mín | Promedio | Máx |
+|---|---|---|---|
+| Respiración (rpm) | 1,0 | 12,2 | 24,0 |
+| Pulso radar (bpm) | 60,0 | 84,2 | 119,0 |
+| Distancia reportada | 23,0 | 32,0 | 45,9 |
+
+**Comparación con el anillo:** en esta sesión se completó **1 comparación**. El anillo midió 83,5 bpm y el radar promedió 69,4 bpm en la ventana de 25 s, así que el error fue de −14,1 bpm (≈ 17 %). Una sola comparación no basta para estimar el error del sistema: hacen falta más pares para calcular un error medio absoluto representativo.
+
+**Observaciones:**
+
+- El pulso del radar varió mucho dentro de la sesión (60–119 bpm), mientras que el valor instantáneo coincidía con el anillo (83 frente a 83,5 bpm). Eso indica que el promedio de la ventana es sensible a los saltos del sensor.
+- La respiración bajó a 1 rpm en algún momento y llegó a 26 rpm, lo que disparó la alerta de "Respiración muy alta". Son valores poco fisiológicos para una persona en reposo, propios del tiempo de establecimiento del sensor o del movimiento.
+- El sistema de alertas respondió en tiempo real a los valores fuera de rango.
 
 ## Limitaciones conocidas
 
